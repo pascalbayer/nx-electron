@@ -1,145 +1,88 @@
-import { BuilderContext, createBuilder, BuilderOutput } from '@angular-devkit/architect';
-import { JsonObject, workspaces } from '@angular-devkit/core';
-import { serialHooks } from 'electron-packager/src/hooks';
-import { Options as ElectronPackagerOptions } from 'electron-packager';
-import electronPackager from 'electron-packager';
-
+import { build, Configuration, Platform, Arch } from 'electron-builder';
+import { writeFile } from 'fs';
 import { join } from 'path';
-import { sync as removeSync } from 'rimraf';
-import { writeFile, readFile, readFileSync, statSync } from 'fs';
 import { promisify } from 'util';
 
-import { Observable, from, of } from 'rxjs';
-import { map, concatMap } from 'rxjs/operators';
-import { normalizePackagingOptions } from '../../utils/normalize';
-import { NodeJsSyncHost } from '@angular-devkit/core/node';
+import {
+    BuilderContext,
+    BuilderOutput,
+    createBuilder
+} from '@angular-devkit/architect';
+import { JsonObject } from '@angular-devkit/core';
 
-try {
-  require('dotenv').config();
-} catch (e) {}
-
-const writeFileAsync = (path: string, data: string) => promisify(writeFile)(path, data);
-const readFileAsync = (path: string) => promisify(readFile)(path);
-
-export interface PackageElectronBuilderOptions extends ElectronPackagerOptions {
-  name: string;
-  frontendProject: string;
+export interface PackageElectronBuilderOptions extends Configuration {
+    name: string;
+    frontendProject: string;
+    out: string;
 }
 
 export interface PackageElectronBuilderOutput extends BuilderOutput {
-  target?: any,
-  outputPath: string | string[];
+    target?: any;
+    outputPath: string | string[];
 }
 
 export default createBuilder<JsonObject & PackageElectronBuilderOptions>(run);
 
-function run(
-  options: JsonObject & PackageElectronBuilderOptions,
-  context: BuilderContext
-): Observable<PackageElectronBuilderOutput> {
-  return from(getSourceRoot(context)).pipe(
-    map(sourceRoot =>
-      normalizePackagingOptions(options, context.workspaceRoot, sourceRoot)
-    ),
-    map(options => 
-      mergePresetOptions(options)
-    ),
-    map(options => 
-      addMissingDefaultOptions(options)
-    ),
-    concatMap(async (options) => {
-      options.afterCopy = [serialHooks([
-        (buildPath, electronVersion, platform, arch) => {
-          return writeFileAsync(join(buildPath, 'index.js'), `const Main = require('./dist/apps/${options.name}/main');`);
-        },
-        (buildPath, electronVersion, platform, arch) => {
-          return removeSourceFiles(options, buildPath);
+async function run(
+    options: JsonObject & PackageElectronBuilderOptions,
+    context: BuilderContext
+): Promise<any> {
+    await promisify(writeFile)(
+        join(context.workspaceRoot, 'dist', 'apps', options.name, 'index.js'),
+        `const Main = require('./${options.name}/main.js');`,
+        { encoding: 'utf8' }
+    );
+    const targets = new Map<Platform, Map<Arch, string[]>>();
+    targets.set(
+        Platform.MAC.createTarget()
+            .entries()
+            .next().value[0],
+        Platform.MAC.createTarget()
+            .entries()
+            .next().value[1]
+    );
+    targets.set(
+        Platform.WINDOWS.createTarget()
+            .entries()
+            .next().value[0],
+        Platform.WINDOWS.createTarget()
+            .entries()
+            .next().value[1]
+    );
+    await build({
+        targets,
+        config: {
+            win: {
+                target: 'portable'
+            },
+            mac: {
+                forceCodeSigning: false,
+                target: 'default'
+            },
+            directories: {
+                output: join(context.workspaceRoot, options.out)
+            },
+            files: [
+                '**/package.json',
+                {
+                    from: `./dist/apps/${options.frontendProject}`,
+                    to: options.frontendProject,
+                    filter: ['*.*']
+                },
+                {
+                    from: `./dist/apps/${options.name}`,
+                    to: options.name,
+                    filter: ['main.js']
+                },
+                {
+                    from: `./dist/apps/${options.name}`,
+                    to: '',
+                    filter: ['index.js']
+                }
+            ],
+            npmRebuild: false,
+            asar: true
         }
-      ])];
-
-      async function packagerWrapper() {
-        let result: PackageElectronBuilderOutput;
-        let outputPath: string | string[];
-        let success: boolean = true;
-
-        try {
-          outputPath = await electronPackager(options);
-        } catch(error) {
-          success = false;
-          console.error('Packaging failed:', error);
-        }
-
-        result = { success, outputPath };
-
-        return result;
-    }
-
-      return await packagerWrapper();
-    })
-  );
-}
-
-async function getSourceRoot(context: BuilderContext) {
-  const workspaceHost = workspaces.createWorkspaceHost(new NodeJsSyncHost());
-  const { workspace } = await workspaces.readWorkspace(
-    context.workspaceRoot,
-    workspaceHost
-  );
-
-  if (workspace.projects.get(context.target.project).sourceRoot) {
-    return workspace.projects.get(context.target.project).sourceRoot;
-  } else {
-    context.reportStatus('Error');
-    const message = `${context.target.project} does not have a sourceRoot. Please define one.`;
-    context.logger.error(message);
-    throw new Error(message);
-  }
-}
-
-function mergePresetOptions(options: PackageElectronBuilderOptions): PackageElectronBuilderOptions {
-  // lead preset options file
-  const externalOptionsPath: string = join(options.dir, options['sourceRoot'], 'app', 'options', 'packager.options.json');
-
-  if (statSync(externalOptionsPath).isFile()) {
-    const rawData = readFileSync(externalOptionsPath, 'utf8')
-    const externalOptions = JSON.parse(rawData);
-    options = Object.assign(options, externalOptions);
-  }
-
-  return options;
-}
-
-function addMissingDefaultOptions(options: PackageElectronBuilderOptions): PackageElectronBuilderOptions {
-  //todo: add appVersion
-
-  // remove unset options (use electron packager default where possible)
-  Object.keys(options).forEach((key) => (options[key] === '') && delete options[key]);
-
-  return options;
-}
-
-function removeSourceFiles(options: PackageElectronBuilderOptions, buildPath: string): Promise<any> {
-  // remove source map files
-  if (options['ignoreSourceMap']) {
-    if (statSync(join(buildPath, 'dist')).isDirectory()) {
-      try {
-        removeSync(join(buildPath, 'dist', '**', '*.js.map'));
-      } catch (error) {
-        error('Failed to remove source map files:', error);
-      }
-    }
-  }
-
-  return new Promise((resolve, reject) => {
-    // remove source files (./apps directory)
-    if (statSync(join(buildPath, 'apps')).isDirectory()) {
-      try {
-        removeSync(join(buildPath, 'apps'));
-      } catch (error) {
-        reject(error);
-      }
-    }
-
-    resolve();
-  });
+    });
+    return { success: true };
 }
